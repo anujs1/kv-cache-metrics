@@ -83,7 +83,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
-    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument(
         "--dump-json",

@@ -59,7 +59,7 @@ class KVCacheMetricsCollector:
     def __init__(
         self,
         model: str,
-        max_model_len: int = 4096,
+        max_model_len: int = 32768,
         gpu_memory_utilization: float = 0.9,
         **llm_kwargs,
     ) -> None:
