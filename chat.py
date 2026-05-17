@@ -1,13 +1,50 @@
 #!/usr/bin/env python3
-"""Interactive multi-turn chat that prints KV cache metrics after each reply."""
+"""Run a multi-turn chat from a file of inputs, printing KV cache metrics after each reply."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from pathlib import Path
+
+# FlashInfer sampler requires CUDA 12+ CCCL headers; disable it so the script
+# works on CUDA 11.x systems. Must be set before vLLM is imported so the
+# EngineCore subprocess inherits the value.
+os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
 from collector import KVCacheMetricsCollector, TurnMetrics
+
+_SUPPORTED_TYPES = {"P"}
+
+
+def _parse_inputs(path: Path) -> list[tuple[str, str]]:
+    """Return a list of (type, content) pairs from the input file.
+
+    Each non-blank, non-comment line must start with a known type identifier
+    followed by a space and the content:
+        P Tell me about prefix caching.
+    """
+    inputs: list[tuple[str, str]] = []
+    for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if len(line) < 3 or line[1] != " ":
+            sys.exit(
+                f"{path}:{lineno}: expected '<TYPE> <content>', got: {raw!r}"
+            )
+        kind, content = line[0].upper(), line[2:].strip()
+        if kind not in _SUPPORTED_TYPES:
+            sys.exit(
+                f"{path}:{lineno}: unknown input type {kind!r}. "
+                f"Supported: {', '.join(sorted(_SUPPORTED_TYPES))}"
+            )
+        if not content:
+            sys.exit(f"{path}:{lineno}: empty content after type identifier")
+        inputs.append((kind, content))
+    return inputs
 
 
 def _format_metrics(m: TurnMetrics) -> str:
@@ -33,7 +70,18 @@ def _format_metrics(m: TurnMetrics) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="KV-cache metrics chat demo")
+    parser = argparse.ArgumentParser(
+        description="Run a scripted multi-turn chat and report KV cache metrics."
+    )
+    parser.add_argument(
+        "inputs",
+        metavar="INPUTS_FILE",
+        type=Path,
+        help=(
+            "Text file of inputs. Each non-blank line: '<TYPE> <content>'. "
+            "Supported types: P (paragraph text). Lines starting with # are comments."
+        ),
+    )
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -44,30 +92,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if not args.inputs.is_file():
+        sys.exit(f"Input file not found: {args.inputs}")
+
+    turns = _parse_inputs(args.inputs)
+    if not turns:
+        sys.exit(f"No inputs found in {args.inputs}")
+
     print(f"Loading model: {args.model}")
     collector = KVCacheMetricsCollector(
         model=args.model,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
-    print("Ready. Type your message (Ctrl-C or 'quit' to exit).\n")
+    print(f"Running {len(turns)} turn(s) from {args.inputs}\n")
 
-    try:
-        while True:
-            try:
-                user_input = input("You: ").strip()
-            except EOFError:
-                break
-            if not user_input or user_input.lower() in {"quit", "exit"}:
-                break
-
-            reply, metrics = collector.chat(user_input)
-            print(f"\nAssistant: {reply}")
-            print(_format_metrics(metrics))
-            print()
-
-    except KeyboardInterrupt:
-        pass
+    for kind, content in turns:
+        # P: send content as a user paragraph
+        print(f"You: {content}")
+        reply, metrics = collector.chat(content)
+        print(f"\nAssistant: {reply}")
+        print(_format_metrics(metrics))
+        print()
 
     summary = collector.session.summary()
     print("\n=== Session Summary ===")
@@ -81,10 +127,7 @@ def main() -> None:
         data = {
             "model": collector.model,
             "summary": summary,
-            "turns": [
-                {k: v for k, v in vars(t).items()}
-                for t in collector.session.turns
-            ],
+            "turns": [vars(t) for t in collector.session.turns],
         }
         with open(args.dump_json, "w") as f:
             json.dump(data, f, indent=2)

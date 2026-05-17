@@ -1,0 +1,7 @@
+# Example input file for chat.py
+# Each non-blank line: <TYPE> <content>
+# P = paragraph (plain text sent as a user message)
+
+P What is KV cache in the context of large language models?
+P How does prefix caching improve inference efficiency?
+P Can you give a concrete example of a workload that benefits most from prefix caching?
