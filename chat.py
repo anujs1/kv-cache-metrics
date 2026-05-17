@@ -14,9 +14,11 @@ from pathlib import Path
 # EngineCore subprocess inherits the value.
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
+from pypdf import PdfReader
+
 from collector import KVCacheMetricsCollector, TurnMetrics
 
-_SUPPORTED_TYPES = {"P"}
+_SUPPORTED_TYPES = {"P", "U"}
 
 
 def _parse_inputs(path: Path) -> list[tuple[str, str]]:
@@ -45,6 +47,17 @@ def _parse_inputs(path: Path) -> list[tuple[str, str]]:
             sys.exit(f"{path}:{lineno}: empty content after type identifier")
         inputs.append((kind, content))
     return inputs
+
+
+def _extract_pdf_text(pdf_path: Path) -> str:
+    reader = PdfReader(pdf_path)
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return "\n\n".join(pages).strip()
+
+
+def _build_pdf_message(pdf_path: Path) -> str:
+    text = _extract_pdf_text(pdf_path)
+    return f"[Uploaded document: {pdf_path.name}]\n\n{text}"
 
 
 def _format_metrics(m: TurnMetrics) -> str:
@@ -79,7 +92,8 @@ def main() -> None:
         type=Path,
         help=(
             "Text file of inputs. Each non-blank line: '<TYPE> <content>'. "
-            "Supported types: P (paragraph text). Lines starting with # are comments."
+            "Supported types: P (paragraph text), U (PDF file path). "
+            "Lines starting with # are comments."
         ),
     )
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
@@ -108,9 +122,17 @@ def main() -> None:
     print(f"Running {len(turns)} turn(s) from {args.inputs}\n")
 
     for kind, content in turns:
-        # P: send content as a user paragraph
-        print(f"You: {content}")
-        reply, metrics = collector.chat(content)
+        if kind == "U":
+            pdf_path = Path(content)
+            if not pdf_path.is_file():
+                sys.exit(f"PDF not found: {content}")
+            print(f"You: [uploading {pdf_path.name}]")
+            message = _build_pdf_message(pdf_path)
+        else:
+            print(f"You: {content}")
+            message = content
+
+        reply, metrics = collector.chat(message)
         print(f"\nAssistant: {reply}")
         print(_format_metrics(metrics))
         print()
