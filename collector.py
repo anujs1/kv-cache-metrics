@@ -3,11 +3,43 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
 from vllm import LLM, SamplingParams
+
+_GiB = 1024 ** 3
+
+# Bytes per element for each supported KV cache dtype.
+_KV_DTYPE_BYTES: dict[str, int] = {
+    "auto": 0,      # resolved at runtime from the model dtype
+    "float16": 2,
+    "bfloat16": 2,
+    "float32": 4,
+    "fp8": 1,
+    "fp8_e4m3": 1,
+    "fp8_e5m2": 1,
+}
+
+# Map torch dtype strings to byte widths.
+_TORCH_DTYPE_BYTES: dict[str, int] = {
+    "torch.float16": 2,
+    "torch.bfloat16": 2,
+    "torch.float32": 4,
+    "torch.float8_e4m3fn": 1,
+}
+
+
+@dataclass
+class MemoryBreakdown:
+    """GPU memory breakdown captured once after the engine initialises."""
+    gpu_total_gb: float
+    gpu_free_gb: float           # free after full init
+    vllm_footprint_gb: float     # total taken by vLLM (free_before - free_after)
+    kv_cache_gb: float           # bytes reserved for the KV block pool
+    kv_cache_tokens: int         # total token capacity of the pool
+    kv_block_size: int           # tokens per block (CacheConfig.block_size)
+    other_gb: float              # model weights + activations + CUDA graph + NCCL
 
 
 @dataclass
@@ -61,20 +93,32 @@ class KVCacheMetricsCollector:
         model: str,
         max_model_len: int = 32768,
         gpu_memory_utilization: float = 0.9,
+        num_gpu_blocks_override: int | None = None,
         **llm_kwargs,
     ) -> None:
         self.model = model
+
+        free_before, gpu_total = torch.cuda.mem_get_info() if torch.cuda.is_available() else (0, 0)
+
         self._llm = LLM(
             model=model,
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
+            num_gpu_blocks_override=num_gpu_blocks_override,
             enable_prefix_caching=True,
             disable_log_stats=False,  # populate RequestOutput.metrics
             **llm_kwargs,
         )
+
+        free_after, _ = torch.cuda.mem_get_info() if torch.cuda.is_available() else (0, 0)
+
         self._kv_tracker = _patch_kv_usage_capture(self._llm)
         cc = self._llm.llm_engine.vllm_config.cache_config
         self._kv_total_tokens: int = (cc.num_gpu_blocks or 0) * cc.block_size
+        self.memory = _compute_memory_breakdown(
+            self._llm, free_before, free_after, gpu_total
+        )
+
         self._history: list[dict] = []
         self.session = SessionMetrics(model=model)
         self._turn = 0
@@ -209,6 +253,42 @@ def _patch_kv_usage_capture(llm: LLM) -> _KVUsageTracker:
 
     lm.record = _record
     return tracker
+
+
+def _compute_memory_breakdown(
+    llm: LLM,
+    free_before: int,
+    free_after: int,
+    gpu_total: int,
+) -> MemoryBreakdown:
+    cc = llm.llm_engine.vllm_config.cache_config
+    mc = llm.llm_engine.vllm_config.model_config
+
+    kv_cache_tokens = (cc.num_gpu_blocks or 0) * cc.block_size
+
+    # Resolve bytes per KV element.
+    dtype_key = cc.cache_dtype if cc.cache_dtype != "auto" else str(mc.hf_config.torch_dtype)
+    elem_bytes = _KV_DTYPE_BYTES.get(cc.cache_dtype) or _TORCH_DTYPE_BYTES.get(dtype_key, 2)
+
+    hf = mc.hf_config
+    num_layers = hf.num_hidden_layers
+    num_kv_heads = hf.num_key_value_heads
+    head_dim = getattr(hf, "head_dim", hf.hidden_size // hf.num_attention_heads)
+    # Factor of 2: one tensor for K, one for V.
+    bytes_per_token = 2 * num_layers * num_kv_heads * head_dim * elem_bytes
+
+    kv_cache_bytes = kv_cache_tokens * bytes_per_token
+    vllm_footprint = free_before - free_after
+
+    return MemoryBreakdown(
+        gpu_total_gb=gpu_total / _GiB,
+        gpu_free_gb=free_after / _GiB,
+        vllm_footprint_gb=vllm_footprint / _GiB,
+        kv_cache_gb=kv_cache_bytes / _GiB,
+        kv_cache_tokens=kv_cache_tokens,
+        kv_block_size=cc.block_size,
+        other_gb=(vllm_footprint - kv_cache_bytes) / _GiB,
+    )
 
 
 def _gpu_memory_gb() -> tuple[float, float]:

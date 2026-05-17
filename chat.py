@@ -100,6 +100,18 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument(
+        "--num-gpu-blocks-override",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Pin the KV cache to exactly N blocks "
+            "(1 block = block_size tokens; default block_size is 16). "
+            "Overrides --gpu-memory-utilization for cache sizing. "
+            "Useful for stress-testing cache pressure with a small pool."
+        ),
+    )
+    parser.add_argument(
         "--dump-json",
         metavar="FILE",
         help="Write session metrics JSON to this file on exit",
@@ -118,6 +130,21 @@ def main() -> None:
         model=args.model,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        num_gpu_blocks_override=args.num_gpu_blocks_override,
+    )
+
+    mem = collector.memory
+    print(
+        f"\n{'─' * 60}\n"
+        f"  [GPU memory after init]\n"
+        f"  Total     : {mem.gpu_total_gb:.2f} GiB\n"
+        f"  Free      : {mem.gpu_free_gb:.2f} GiB\n"
+        f"  vLLM used : {mem.vllm_footprint_gb:.2f} GiB\n"
+        f"    KV cache: {mem.kv_cache_gb:.2f} GiB  "
+        f"({mem.kv_cache_tokens:,} tokens, block_size={mem.kv_block_size})\n"
+        f"    Other   : {mem.other_gb:.2f} GiB  "
+        f"(model weights + activations + CUDA graph)\n"
+        f"{'─' * 60}\n"
     )
     print(f"Running {len(turns)} turn(s) from {args.inputs}\n")
 
